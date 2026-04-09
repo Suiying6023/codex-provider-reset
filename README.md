@@ -2,9 +2,25 @@
 
 一个最简 PowerShell 脚本，用于统一 Codex 的 `model_provider` 与本地线程状态。
 
+## 原因
+
+Codex 会把本地线程状态记录到 `~/.codex/state_5.sqlite`，其中每条线程都带有一个 `model_provider`。
+
+如果不同中转站或 `CC Switch` 写出的配置使用了不同的 `model_provider`，那么本地线程会被分到不同的 provider 命名空间中。
+
+## 思路
+
+脚本不处理聊天内容文件本身，只处理当前配置与本地线程状态中的 `model_provider`：
+
+- `current` 模式：按当前 Codex 配置里的标记统一历史线程
+- `ccs` 模式：按 `CC Switch` 的 `codex` 配置统一为 `codex`
+
 ## 文件
 
 - `reset-provider.ps1`
+- `sqlite3.exe`
+
+脚本会优先使用同目录下的 `sqlite3.exe`，不依赖系统 PATH。
 
 ## 运行模式
 
@@ -44,7 +60,19 @@ powershell -ExecutionPolicy Bypass -File .\reset-provider.ps1 `
   -CcSwitchDbPath "C:\path\to\.cc-switch\cc-switch.db"
 ```
 
+如果你不想使用仓库内自带的 `sqlite3.exe`，也可以显式指定：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\reset-provider.ps1 `
+  -Mode current `
+  -Sqlite3Path "C:\path\to\sqlite3.exe"
+```
+
 ## 依赖
 
 - Windows PowerShell
-- `sqlite3` 已加入系统 `PATH`
+
+## 注意
+
+- 脚本会直接修改本地数据库与配置文件
+- 脚本不会重建损坏或空白的会话文件
