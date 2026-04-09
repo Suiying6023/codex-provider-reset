@@ -3,7 +3,8 @@ param(
     [string]$Mode = "current",
     [string]$CodexConfigPath = (Join-Path $HOME ".codex\config.toml"),
     [string]$CodexStateDbPath = (Join-Path $HOME ".codex\state_5.sqlite"),
-    [string]$CcSwitchDbPath = (Join-Path $HOME ".cc-switch\cc-switch.db")
+    [string]$CcSwitchDbPath = (Join-Path $HOME ".cc-switch\cc-switch.db"),
+    [string]$Sqlite3Path = ""
 )
 
 Set-StrictMode -Version Latest
@@ -31,6 +32,32 @@ function Escape-SqlLiteral {
     return $Value -replace "'", "''"
 }
 
+function Resolve-Sqlite3Path {
+    param(
+        [AllowEmptyString()]
+        [string]$PreferredPath
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($PreferredPath)) {
+        if (-not (Test-Path -LiteralPath $PreferredPath)) {
+            throw "sqlite3 not found: $PreferredPath"
+        }
+        return $PreferredPath
+    }
+
+    $bundled = Join-Path $PSScriptRoot "sqlite3.exe"
+    if (Test-Path -LiteralPath $bundled) {
+        return $bundled
+    }
+
+    $command = Get-Command sqlite3 -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return $command.Source
+    }
+
+    throw "sqlite3 executable not found. Put sqlite3.exe next to reset-provider.ps1 or pass -Sqlite3Path."
+}
+
 function Invoke-SqlNonQuery {
     param(
         [Parameter(Mandatory = $true)]
@@ -39,7 +66,7 @@ function Invoke-SqlNonQuery {
         [string]$Sql
     )
 
-    $Sql | & sqlite3 $Database | Out-Null
+    $Sql | & $script:Sqlite3Exe $Database | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "sqlite3 update failed."
     }
@@ -53,7 +80,7 @@ function Invoke-SqlScalar {
         [string]$Sql
     )
 
-    $value = & sqlite3 $Database $Sql
+    $value = & $script:Sqlite3Exe $Database $Sql
     if ($LASTEXITCODE -ne 0) {
         throw "sqlite3 scalar query failed."
     }
@@ -95,7 +122,7 @@ function Invoke-SqlRows {
     )
 
     $separator = [char]31
-    $raw = & sqlite3 -separator $separator $Database $Sql
+    $raw = & $script:Sqlite3Exe -separator $separator $Database $Sql
     if ($LASTEXITCODE -ne 0) {
         throw "sqlite3 row query failed."
     }
@@ -179,6 +206,7 @@ function Get-StateCounts {
 
 Assert-PathExists -Path $CodexConfigPath -Label "Codex config"
 Assert-PathExists -Path $CodexStateDbPath -Label "Codex state database"
+$script:Sqlite3Exe = Resolve-Sqlite3Path -PreferredPath $Sqlite3Path
 
 $updatedCcSwitchProviders = New-Object System.Collections.Generic.List[string]
 $targetProvider = $null
@@ -236,6 +264,7 @@ $afterCounts = Get-StateCounts -Database $CodexStateDbPath
 [ordered]@{
     mode = $Mode
     target_provider = $targetProvider
+    sqlite3_path = $script:Sqlite3Exe
     updated_ccswitch_provider_count = $updatedCcSwitchProviders.Count
     updated_ccswitch_providers = @($updatedCcSwitchProviders)
     migrated_thread_rows = $rowsToMigrateCount
