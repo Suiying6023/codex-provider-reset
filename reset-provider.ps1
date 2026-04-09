@@ -22,32 +22,16 @@ function Assert-PathExists {
     }
 }
 
-function Invoke-SqlJson {
+function Escape-SqlLiteral {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Database,
-        [Parameter(Mandatory = $true)]
-        [string]$Sql
+        [string]$Value
     )
 
-    $raw = & sqlite3 -json $Database $Sql
-    if ($LASTEXITCODE -ne 0) {
-        throw "sqlite3 query failed."
-    }
-
-    if ([string]::IsNullOrWhiteSpace($raw)) {
-        return @()
-    }
-
-    $parsed = $raw | ConvertFrom-Json
-    if ($parsed -is [System.Array]) {
-        return $parsed
-    }
-
-    return @($parsed)
+    return $Value -replace "'", "''"
 }
 
-function Invoke-Sql {
+function Invoke-SqlNonQuery {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Database,
@@ -61,13 +45,89 @@ function Invoke-Sql {
     }
 }
 
-function Escape-SqlLiteral {
+function Invoke-SqlScalar {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Value
+        [string]$Database,
+        [Parameter(Mandatory = $true)]
+        [string]$Sql
     )
 
-    return $Value -replace "'", "''"
+    $value = & sqlite3 $Database $Sql
+    if ($LASTEXITCODE -ne 0) {
+        throw "sqlite3 scalar query failed."
+    }
+
+    if ($value -is [System.Array]) {
+        return ($value -join "")
+    }
+
+    return [string]$value
+}
+
+function Convert-HexToUtf8String {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Hex
+    )
+
+    if ([string]::IsNullOrEmpty($Hex)) {
+        return ""
+    }
+
+    $bytes = New-Object byte[] ($Hex.Length / 2)
+    for ($i = 0; $i -lt $Hex.Length; $i += 2) {
+        $bytes[$i / 2] = [Convert]::ToByte($Hex.Substring($i, 2), 16)
+    }
+
+    return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Invoke-SqlRows {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Database,
+        [Parameter(Mandatory = $true)]
+        [string]$Sql,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Columns
+    )
+
+    $separator = [char]31
+    $raw = & sqlite3 -separator $separator $Database $Sql
+    if ($LASTEXITCODE -ne 0) {
+        throw "sqlite3 row query failed."
+    }
+
+    $lines = @()
+    if ($null -eq $raw) {
+        return @()
+    } elseif ($raw -is [System.Array]) {
+        $lines = $raw
+    } else {
+        $text = [string]$raw
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            return @()
+        }
+        $lines = @($text -split "`r?`n")
+    }
+
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        $parts = [string]$line -split [regex]::Escape([string]$separator), $Columns.Count
+        $row = [ordered]@{}
+        for ($i = 0; $i -lt $Columns.Count; $i++) {
+            $row[$Columns[$i]] = if ($i -lt $parts.Count) { $parts[$i] } else { "" }
+        }
+        $result.Add([pscustomobject]$row) | Out-Null
+    }
+
+    return $result
 }
 
 function Get-CurrentProviderId {
@@ -108,6 +168,15 @@ function Normalize-ConfigTextToProvider {
     return $normalized
 }
 
+function Get-StateCounts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Database
+    )
+
+    return Invoke-SqlRows -Database $Database -Sql "SELECT model_provider, COUNT(*) FROM threads GROUP BY model_provider ORDER BY COUNT(*) DESC;" -Columns @("model_provider", "count")
+}
+
 Assert-PathExists -Path $CodexConfigPath -Label "Codex config"
 Assert-PathExists -Path $CodexStateDbPath -Label "Codex state database"
 
@@ -122,24 +191,30 @@ if ($Mode -eq "ccs") {
     Assert-PathExists -Path $CcSwitchDbPath -Label "CC Switch database"
     $targetProvider = "codex"
 
-    $providerRows = Invoke-SqlJson -Database $CcSwitchDbPath -Sql "SELECT id, name, settings_config FROM providers WHERE app_type = 'codex';"
+    $providerRows = Invoke-SqlRows -Database $CcSwitchDbPath -Sql "SELECT id, name, hex(settings_config) FROM providers WHERE app_type = 'codex';" -Columns @("id", "name", "settings_config_hex")
     foreach ($row in $providerRows) {
-        $settings = $row.settings_config | ConvertFrom-Json
+        $settingsConfig = Convert-HexToUtf8String -Hex $row.settings_config_hex
+        try {
+            $settings = $settingsConfig | ConvertFrom-Json
+        } catch {
+            throw "Failed to parse settings_config JSON for CC Switch provider '$($row.name)' (id=$($row.id))."
+        }
+
         if (-not $settings.PSObject.Properties.Name.Contains("config")) {
             continue
         }
 
-        $newConfig = Normalize-ConfigTextToProvider -ConfigText $settings.config -ProviderId $targetProvider
+        $newConfig = Normalize-ConfigTextToProvider -ConfigText ([string]$settings.config) -ProviderId $targetProvider
         if ($newConfig -eq $settings.config) {
             continue
         }
 
         $settings.config = $newConfig
-        $newSettingsJson = $settings | ConvertTo-Json -Compress -Depth 10
+        $newSettingsJson = $settings | ConvertTo-Json -Compress -Depth 20
         $escapedSettings = Escape-SqlLiteral -Value $newSettingsJson
         $escapedId = Escape-SqlLiteral -Value ([string]$row.id)
-        Invoke-Sql -Database $CcSwitchDbPath -Sql "UPDATE providers SET settings_config = '$escapedSettings' WHERE id = '$escapedId';"
-        $updatedCcSwitchProviders.Add([string]$row.name)
+        Invoke-SqlNonQuery -Database $CcSwitchDbPath -Sql "UPDATE providers SET settings_config = '$escapedSettings' WHERE id = '$escapedId';"
+        $updatedCcSwitchProviders.Add([string]$row.name) | Out-Null
     }
 
     $liveConfig = Get-Content -LiteralPath $CodexConfigPath -Raw
@@ -149,15 +224,14 @@ if ($Mode -eq "ccs") {
     }
 }
 
-$beforeCounts = Invoke-SqlJson -Database $CodexStateDbPath -Sql "SELECT model_provider, COUNT(*) AS count FROM threads GROUP BY model_provider ORDER BY count DESC;"
-$rowsToMigrate = Invoke-SqlJson -Database $CodexStateDbPath -Sql "SELECT COUNT(*) AS count FROM threads WHERE model_provider <> '$targetProvider';"
-$rowsToMigrateCount = if ($rowsToMigrate.Count -gt 0) { [int]$rowsToMigrate[0].count } else { 0 }
+$beforeCounts = Get-StateCounts -Database $CodexStateDbPath
+$rowsToMigrateCount = [int](Invoke-SqlScalar -Database $CodexStateDbPath -Sql "SELECT COUNT(*) FROM threads WHERE model_provider <> '$(Escape-SqlLiteral -Value $targetProvider)';")
 
 if ($rowsToMigrateCount -gt 0) {
-    Invoke-Sql -Database $CodexStateDbPath -Sql "BEGIN IMMEDIATE; UPDATE threads SET model_provider = '$targetProvider' WHERE model_provider <> '$targetProvider'; COMMIT;"
+    Invoke-SqlNonQuery -Database $CodexStateDbPath -Sql "BEGIN IMMEDIATE; UPDATE threads SET model_provider = '$(Escape-SqlLiteral -Value $targetProvider)' WHERE model_provider <> '$(Escape-SqlLiteral -Value $targetProvider)'; COMMIT;"
 }
 
-$afterCounts = Invoke-SqlJson -Database $CodexStateDbPath -Sql "SELECT model_provider, COUNT(*) AS count FROM threads GROUP BY model_provider ORDER BY count DESC;"
+$afterCounts = Get-StateCounts -Database $CodexStateDbPath
 
 [ordered]@{
     mode = $Mode
@@ -167,4 +241,4 @@ $afterCounts = Invoke-SqlJson -Database $CodexStateDbPath -Sql "SELECT model_pro
     migrated_thread_rows = $rowsToMigrateCount
     before_state_counts = $beforeCounts
     after_state_counts = $afterCounts
-} | ConvertTo-Json -Depth 10
+} | ConvertTo-Json -Depth 20
