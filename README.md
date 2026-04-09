@@ -15,6 +15,8 @@ Codex 会把本地线程状态记录到 `~/.codex/state_5.sqlite`，其中每条
 - `current` 模式：按当前 Codex 配置里的标记统一历史线程
 - `ccs` 模式：按 `CC Switch` 的 `codex` 配置统一为 `codex`
 
+脚本还支持输出或补回线程原来的工作区列表，方便 Codex 在界面里重新显示这些线程。
+
 ## 文件
 
 - `reset-provider.ps1`
@@ -45,6 +47,25 @@ powershell -ExecutionPolicy Bypass -File .\reset-provider.ps1 -Mode ccs
 
 ## 可选参数
 
+### 工作区处理
+
+- `-WorkspaceAction list`
+  输出线程涉及的工作区列表
+- `-WorkspaceAction sync`
+  把检测到的活跃线程工作区补回 `~/.codex/.codex-global-state.json`
+- `-WorkspaceAction none`
+  不输出工作区信息，也不修改工作区配置
+
+示例：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\reset-provider.ps1 -Mode ccs -WorkspaceAction list
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\reset-provider.ps1 -Mode ccs -WorkspaceAction sync
+```
+
 如果本机路径不是默认值，可以手动指定：
 
 ```powershell
@@ -58,6 +79,15 @@ powershell -ExecutionPolicy Bypass -File .\reset-provider.ps1 `
 powershell -ExecutionPolicy Bypass -File .\reset-provider.ps1 `
   -Mode ccs `
   -CcSwitchDbPath "C:\path\to\.cc-switch\cc-switch.db"
+```
+
+如果需要补回工作区配置，也可以显式指定全局状态文件：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\reset-provider.ps1 `
+  -Mode ccs `
+  -WorkspaceAction sync `
+  -GlobalStatePath "C:\path\to\.codex\.codex-global-state.json"
 ```
 
 如果你不想使用仓库内自带的 `sqlite3.exe`，也可以显式指定：
@@ -76,3 +106,4 @@ powershell -ExecutionPolicy Bypass -File .\reset-provider.ps1 `
 
 - 脚本会直接修改本地数据库与配置文件
 - 脚本不会重建损坏或空白的会话文件
+- 如果使用 `-WorkspaceAction sync`，脚本会修改 `~/.codex/.codex-global-state.json`
