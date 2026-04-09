@@ -4,7 +4,10 @@ param(
     [string]$CodexConfigPath = (Join-Path $HOME ".codex\config.toml"),
     [string]$CodexStateDbPath = (Join-Path $HOME ".codex\state_5.sqlite"),
     [string]$CcSwitchDbPath = (Join-Path $HOME ".cc-switch\cc-switch.db"),
-    [string]$Sqlite3Path = ""
+    [string]$Sqlite3Path = "",
+    [ValidateSet("list", "sync", "none")]
+    [string]$WorkspaceAction = "list",
+    [string]$GlobalStatePath = (Join-Path $HOME ".codex\.codex-global-state.json")
 )
 
 Set-StrictMode -Version Latest
@@ -271,6 +274,129 @@ function Get-StateCounts {
     return Invoke-SqlRows -Database $Database -Sql "SELECT model_provider, COUNT(*) FROM threads GROUP BY model_provider ORDER BY COUNT(*) DESC;" -Columns @("model_provider", "count")
 }
 
+function Normalize-WorkspacePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    $normalized = $Path -replace '^[\\/]{2}\?\\', ''
+    $normalized = $normalized.Trim()
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $normalized
+    }
+
+    return $normalized.TrimEnd('\', '/')
+}
+
+function Get-WorkspaceSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Database
+    )
+
+    $rows = Invoke-SqlRows -Database $Database -Sql "SELECT cwd, archived FROM threads ORDER BY updated_at DESC;" -Columns @("cwd", "archived")
+    $map = @{}
+
+    foreach ($row in $rows) {
+        $cwd = Normalize-WorkspacePath -Path ([string]$row.cwd)
+        if ([string]::IsNullOrWhiteSpace($cwd)) {
+            continue
+        }
+
+        if (-not $map.ContainsKey($cwd)) {
+            $map[$cwd] = [ordered]@{
+                cwd = $cwd
+                active_threads = 0
+                archived_threads = 0
+            }
+        }
+
+        if ([string]$row.archived -eq "1") {
+            $map[$cwd].archived_threads += 1
+        } else {
+            $map[$cwd].active_threads += 1
+        }
+    }
+
+    return @(
+        $map.Values |
+            Sort-Object -Property @{ Expression = "active_threads"; Descending = $true }, @{ Expression = "archived_threads"; Descending = $true }, @{ Expression = "cwd"; Descending = $false }
+    )
+}
+
+function Merge-UniqueOrdered {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Existing,
+        [Parameter(Mandatory = $true)]
+        [object[]]$Incoming
+    )
+
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @($Existing) + @($Incoming)) {
+        if ($null -eq $item) {
+            continue
+        }
+        $text = [string]$item
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+        if (-not $list.Contains($text)) {
+            $list.Add($text) | Out-Null
+        }
+    }
+
+    return @($list)
+}
+
+function Sync-WorkspaceRoots {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StatePath,
+        [Parameter(Mandatory = $true)]
+        [object[]]$WorkspaceSummary
+    )
+
+    if (-not (Test-Path -LiteralPath $StatePath)) {
+        return $null
+    }
+
+    $stateText = Get-Content -LiteralPath $StatePath -Raw
+    $state = $stateText | ConvertFrom-Json
+    $roots = @($WorkspaceSummary | Where-Object { $_.active_threads -gt 0 } | ForEach-Object { $_.cwd })
+
+    if ($roots.Count -eq 0) {
+        return [ordered]@{
+            added_saved_roots = @()
+            added_active_roots = @()
+            added_project_order = @()
+        }
+    }
+
+    $savedBefore = @($state.'electron-saved-workspace-roots')
+    $activeBefore = @($state.'active-workspace-roots')
+    $projectOrderBefore = @($state.'project-order')
+
+    $savedAfter = Merge-UniqueOrdered -Existing $savedBefore -Incoming $roots
+    $activeAfter = Merge-UniqueOrdered -Existing $activeBefore -Incoming $roots
+    $projectOrderAfter = Merge-UniqueOrdered -Existing $projectOrderBefore -Incoming $roots
+
+    $state.'electron-saved-workspace-roots' = $savedAfter
+    $state.'active-workspace-roots' = $activeAfter
+    $state.'project-order' = $projectOrderAfter
+
+    $json = $state | ConvertTo-Json -Depth 50 -Compress
+    Set-Content -LiteralPath $StatePath -Value $json -NoNewline
+
+    return [ordered]@{
+        added_saved_roots = @($savedAfter | Where-Object { $savedBefore -notcontains $_ })
+        added_active_roots = @($activeAfter | Where-Object { $activeBefore -notcontains $_ })
+        added_project_order = @($projectOrderAfter | Where-Object { $projectOrderBefore -notcontains $_ })
+    }
+}
+
 Assert-PathExists -Path $CodexConfigPath -Label "Codex config"
 Assert-PathExists -Path $CodexStateDbPath -Label "Codex state database"
 $script:Sqlite3Exe = Resolve-Sqlite3Path -PreferredPath $Sqlite3Path
@@ -328,14 +454,23 @@ if ($rowsToMigrateCount -gt 0) {
 }
 
 $afterCounts = Get-StateCounts -Database $CodexStateDbPath
+$workspaceSummary = Get-WorkspaceSummary -Database $CodexStateDbPath
+$workspaceSync = $null
+
+if ($WorkspaceAction -eq "sync") {
+    $workspaceSync = Sync-WorkspaceRoots -StatePath $GlobalStatePath -WorkspaceSummary $workspaceSummary
+}
 
 [ordered]@{
     mode = $Mode
     target_provider = $targetProvider
     sqlite3_path = $script:Sqlite3Exe
+    workspace_action = $WorkspaceAction
     updated_ccswitch_provider_count = $updatedCcSwitchProviders.Count
     updated_ccswitch_providers = @($updatedCcSwitchProviders)
     migrated_thread_rows = $rowsToMigrateCount
     before_state_counts = $beforeCounts
     after_state_counts = $afterCounts
+    workspace_summary = if ($WorkspaceAction -eq "none") { @() } else { $workspaceSummary }
+    workspace_sync = $workspaceSync
 } | ConvertTo-Json -Depth 20
