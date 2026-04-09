@@ -172,6 +172,73 @@ function Get-CurrentProviderId {
     return $match.Groups[1].Value
 }
 
+function Get-SettingsConfigText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Settings
+    )
+
+    if ($null -eq $Settings) {
+        return $null
+    }
+
+    if ($Settings -is [System.Array]) {
+        if ($Settings.Count -eq 1) {
+            return Get-SettingsConfigText -Settings $Settings[0]
+        }
+        return $null
+    }
+
+    if ($Settings -is [System.Collections.IDictionary]) {
+        if ($Settings.Contains("config")) {
+            return [string]$Settings["config"]
+        }
+        return $null
+    }
+
+    $member = $Settings | Get-Member -Name "config" -MemberType NoteProperty, Property -ErrorAction SilentlyContinue
+    if ($null -ne $member) {
+        return [string]$Settings.config
+    }
+
+    return $null
+}
+
+function Set-SettingsConfigText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Settings,
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    if ($null -eq $Settings) {
+        throw "settings object is null."
+    }
+
+    if ($Settings -is [System.Array]) {
+        if ($Settings.Count -eq 1) {
+            Set-SettingsConfigText -Settings $Settings[0] -Value $Value
+            return
+        }
+        throw "settings object is an unexpected array."
+    }
+
+    if ($Settings -is [System.Collections.IDictionary]) {
+        $Settings["config"] = $Value
+        return
+    }
+
+    $member = $Settings | Get-Member -Name "config" -MemberType NoteProperty, Property -ErrorAction SilentlyContinue
+    if ($null -eq $member) {
+        throw "settings object does not contain config."
+    }
+
+    $Settings.config = $Value
+}
+
 function Normalize-ConfigTextToProvider {
     param(
         [Parameter(Mandatory = $true)]
@@ -228,16 +295,17 @@ if ($Mode -eq "ccs") {
             throw "Failed to parse settings_config JSON for CC Switch provider '$($row.name)' (id=$($row.id))."
         }
 
-        if (-not $settings.PSObject.Properties.Name.Contains("config")) {
+        $configText = Get-SettingsConfigText -Settings $settings
+        if ([string]::IsNullOrEmpty($configText)) {
             continue
         }
 
-        $newConfig = Normalize-ConfigTextToProvider -ConfigText ([string]$settings.config) -ProviderId $targetProvider
-        if ($newConfig -eq $settings.config) {
+        $newConfig = Normalize-ConfigTextToProvider -ConfigText $configText -ProviderId $targetProvider
+        if ($newConfig -eq $configText) {
             continue
         }
 
-        $settings.config = $newConfig
+        Set-SettingsConfigText -Settings $settings -Value $newConfig
         $newSettingsJson = $settings | ConvertTo-Json -Compress -Depth 20
         $escapedSettings = Escape-SqlLiteral -Value $newSettingsJson
         $escapedId = Escape-SqlLiteral -Value ([string]$row.id)
